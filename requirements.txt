@@ -1,0 +1,11 @@
+streamlit
+requests
+google-generativeai
+python-dotenv
+pandas
+plotly
+textblob
+scikit-learn
+xgboost
+sentence-transformers
+faiss-cpu

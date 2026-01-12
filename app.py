@@ -58,7 +58,7 @@ if run_btn:
     if not api_key:
         # Fallback for demo if users keeps forgetting, but ideally warn
         # st.warning("Using limited demo key...") 
-        api_key = "AIzaSyBOu7AaLAuFg0JiFzE4Qm8jtL4tTMdUu_o"
+        api_key = "test"
 
     with st.spinner("📡 Fetching & Normalizing Data..."):
         subs = [s.strip() for s in sub_input.split(',')]

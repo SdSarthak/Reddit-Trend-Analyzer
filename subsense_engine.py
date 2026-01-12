@@ -10,24 +10,23 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 import xgboost as xgb
 import logging
+import google.generativeai as genai
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Essential ML imports - fail hard if missing because they are core features now
+ML_AVAILABLE = False
 try:
     from sentence_transformers import SentenceTransformer
     import faiss
+    ML_AVAILABLE = True
 except ImportError as e:
-    logger.error(f"Critical Import Error: {e}. Please ensure sentence-transformers and faiss-cpu are installed.")
-    # Define dummy for safety if user runs without satisfying requirements immediately
-    class SentenceTransformer:
-        def __init__(self, model_name): pass
-        def encode(self, texts): return np.array([])
+    logger.error(f"Critical Import Error: {e}. RAG features will be disabled.")
+    SentenceTransformer = None
     faiss = None
 
-import google.generativeai as genai
 
 # --- 1. Data Acquisition & Normalization ---
 
@@ -254,19 +253,18 @@ class RAGEngine:
     def __init__(self, api_key):
         self.index = None
         self.docs = []
+        self.embedder = None # Default to None
         logger.info("Initializing RAGEngine.")
         
-        if 'SentenceTransformer' not in globals() or SentenceTransformer.__module__ == __name__:
-             # Check if it was dummy
+        if ML_AVAILABLE and SentenceTransformer is not None:
              try:
-                 from sentence_transformers import SentenceTransformer
                  self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
                  logger.info("SentenceTransformer loaded.")
              except Exception as e:
-                 logger.error(f"Failed to load real SentenceTransformer: {e}")
+                 logger.error(f"Failed to instantiate SentenceTransformer: {e}")
                  self.embedder = None
         else:
-            self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
+            logger.warning("RAG Engine disabled due to missing ML dependencies.")
             
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-2.5-flash')

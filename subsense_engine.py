@@ -1,10 +1,21 @@
-# ... [Imports and Logging unchanged] ...
 import time
 import os
 import joblib
 import json
+import logging
+import requests
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+from typing import List, Dict, Optional, Any
+from datetime import datetime
+from textblob import TextBlob
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans
 
-# ... [Logging Setup unchanged] ...
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Essential ML imports
 ML_AVAILABLE = False

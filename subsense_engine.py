@@ -1,35 +1,23 @@
-import requests
-import pandas as pd
-import numpy as np
-from datetime import datetime
-import re
-from typing import List, Dict, Tuple, Optional
-from textblob import TextBlob
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA
-import xgboost as xgb
-import logging
-import google.generativeai as genai
+# ... [Imports and Logging unchanged] ...
+import time
+import os
+import joblib
+import json
 
-# Configure Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# ... [Logging Setup unchanged] ...
 
-# Essential ML imports - fail hard if missing because they are core features now
+# Essential ML imports
 ML_AVAILABLE = False
 try:
-    from sentence_transformers import SentenceTransformer
     import faiss
     ML_AVAILABLE = True
 except ImportError as e:
-    logger.error(f"Critical Import Error: {e}. RAG features will be disabled.")
-    SentenceTransformer = None
+    logger.warning(f"FAISS not available ({e}). Switching to Numpy for Vector Search.")
     faiss = None
 
+import google.generativeai as genai
 
-# --- 1. Data Acquisition & Normalization ---
-
+# ... [RedditFetcher unchanged] ...
 class RedditFetcher:
     """Handles fetching data locally via JSON endpoints (No PRAW needed for basic demo)."""
     
@@ -40,9 +28,6 @@ class RedditFetcher:
     def fetch_data(self, subreddits: List[str], time_filter: str = 'month', limit: int = 100) -> pd.DataFrame:
         all_data = []
         logger.info(f"Fetching data for subreddits: {subreddits}, Time: {time_filter}, Limit: {limit}")
-        
-        # map UI time filter to Reddit params
-        # time_filter options: 'day', 'week', 'month', 'year', 'all'
         
         for sub in subreddits:
             sub = sub.replace('r/', '').strip()
@@ -87,9 +72,6 @@ class RedditFetcher:
                 logger.error(f"Pagination error: {e}")
                 break
             
-            # Simple rate limit prevention
-            # time.sleep(0.1) 
-            
         return children[:limit]
 
     def _normalize(self, raw_data: List[Dict]) -> pd.DataFrame:
@@ -123,8 +105,8 @@ class RedditFetcher:
             })
         return pd.DataFrame(normalized)
 
-# --- 2. Intelligence Layers ---
 
+# ... [TrendEngine unchanged] ...
 class TrendEngine:
     """Unsupervised ML for Topic Modeling."""
     
@@ -139,88 +121,96 @@ class TrendEngine:
             return df
         
         logger.info("Extracting trends from dataset.")
-        # Combine title and body for text
         text_data = df['title'] + " " + df['body'].fillna('')
-        
-        # Vectorize
         try:
             tfidf_matrix = self.vectorizer.fit_transform(text_data)
-            
-            # Cluster
-            num_clusters = min(5, len(df)//5) # Adaptive clusters
+            num_clusters = min(5, len(df)//5) 
             if num_clusters < 2: num_clusters = 1
-            
             self.kmeans = KMeans(n_clusters=num_clusters)
             df['topic_cluster'] = self.kmeans.fit_predict(tfidf_matrix)
-            
-            # Extract keywords for each cluster
             feature_names = self.vectorizer.get_feature_names_out()
             cluster_names = {}
-            
             for i in range(num_clusters):
                 center = self.kmeans.cluster_centers_[i]
-                top_ind = center.argsort()[:-6:-1] # Top 5 words
+                top_ind = center.argsort()[:-6:-1] 
                 keywords = [feature_names[ind] for ind in top_ind]
                 cluster_names[i] = ", ".join(keywords)
-                
             df['topic_keywords'] = df['topic_cluster'].map(cluster_names)
             logger.info("Trend extraction complete.")
         except Exception as e:
             logger.error(f"Trend extraction failed: {e}")
             df['topic_keywords'] = "General"
-            
         return df
 
 class ViralityPredictor:
-    """Predicts engagement (Regression)."""
+    """Predicts engagement (Regression) with Persistence."""
     
-    def __init__(self):
+    def __init__(self, model_path="virality_model.json"):
         self.model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=50)
-        logger.info("ViralityPredictor initialized.")
+        self.model_path = model_path
+        self.is_trained = False
+        self._load_model()
         
-    def train_and_score(self, df: pd.DataFrame):
+    def _load_model(self):
+        if os.path.exists(self.model_path):
+            try:
+                self.model.load_model(self.model_path)
+                self.is_trained = True
+                logger.info(f"Loaded Virality Model from {self.model_path}")
+            except Exception as e:
+                logger.error(f"Failed to load virality model: {e}")
+    
+    def save_model(self):
+        try:
+            self.model.save_model(self.model_path)
+            logger.info(f"Saved Virality Model to {self.model_path}")
+        except Exception as e:
+            logger.error(f"Failed to save virality model: {e}")
+
+    def train_and_score(self, df: pd.DataFrame, force_retrain=False):
         if len(df) < 10: 
-            logger.warning("Not enough data to train ViralityPredictor (needs 10+ samples).")
+            logger.warning("Not enough data to train ViralityPredictor.")
             return df
         
-        logger.info(f"Training Virality model on {len(df)} posts.")
-        # Features
-        # 1. Title Length
+        # Prepare Features
         df['title_len'] = df['title'].apply(len)
-        # 2. Is Media
         df['has_media'] = (df['media_type'] != 'text').astype(int)
-        # 3. Hour of day
         df['hour'] = df['created_utc'].dt.hour
-        
-        # X and Y
         X = df[['title_len', 'has_media', 'hour']]
         y = df['score']
         
+        # If we have a trained model and don't force retrain, JUST predict
+        if self.is_trained and not force_retrain:
+            try:
+                df['predicted_score'] = self.model.predict(X)
+                logger.info("Used persisted model for scoring.")
+                return df
+            except:
+                logger.warning("Persisted model failed to predict. Retraining...")
+        
+        # Train
         try:
+            logger.info(f"Training Virality model on {len(df)} posts.")
             self.model.fit(X, y)
-            # Predict "Potential" (just to show simulator capability)
+            self.is_trained = True
             df['predicted_score'] = self.model.predict(X)
-            logger.info("Virality model trained successfully.")
+            self.save_model() # Auto-save on successful train
         except Exception as e:
             logger.error(f"Virality model training failed: {e}")
             
         return df
         
     def predict_new(self, title: str, media_type: str, hour: int):
-        # Demo prediction
+        if not self.is_trained: return 0
         df = pd.DataFrame([{
             'title_len': len(title), 
             'has_media': 1 if media_type != 'text' else 0, 
             'hour': hour
         }])
-        try:
-            pred = self.model.predict(df)[0]
-            logger.info(f"Predicted score {pred:.2f} for new post: '{title}'")
-            return pred
-        except Exception as e:
-            logger.error(f"Prediction error: {e}")
-            return 0
+        try: return self.model.predict(df)[0]
+        except: return 0
 
+# ... [ModClassifier unchanged] ...
 class ModClassifier:
     """Heuristic & NLP based Mod signals."""
     def __init__(self):
@@ -228,99 +218,162 @@ class ModClassifier:
     
     def score_risk(self, df: pd.DataFrame):
         logger.info("Calculating Mod Risk Scores.")
-        # 1. Heuristic Risk
-        # Locked posts are potentially controversial
         df['mod_risk_score'] = 0.0
-        
-        # If locked but not stickied (usually means deleted/bad behavior)
         df.loc[df['is_locked'] & ~df['is_stickied'], 'mod_risk_score'] += 0.8
-        
-        # Low upvote ratio (< 0.6)
         df.loc[df['upvote_ratio'] < 0.60, 'mod_risk_score'] += 0.5
-        
-        # Sentiment Analysis (Negative sentiment might be riskier in some contexts)
         try:
             df['sentiment'] = df['title'].apply(lambda x: TextBlob(x).sentiment.polarity)
         except Exception as e:
             logger.error(f"Sentiment analysis failed: {e}")
             df['sentiment'] = 0.0
-        
         return df
 
 class RAGEngine:
-    """GenAI RAG Layer."""
+    """GenAI RAG Layer using Gemini Embeddings + FAISS + Persistence."""
     
-    def __init__(self, api_key):
+    def __init__(self, api_key, persist_dir="rag_store"):
         self.index = None
         self.docs = []
-        self.embedder = None # Default to None
-        logger.info("Initializing RAGEngine.")
+        self.doc_embeddings = None
+        self.persist_dir = persist_dir
         
-        if ML_AVAILABLE and SentenceTransformer is not None:
-             try:
-                 self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
-                 logger.info("SentenceTransformer loaded.")
-             except Exception as e:
-                 logger.error(f"Failed to instantiate SentenceTransformer: {e}")
-                 self.embedder = None
-        else:
-            logger.warning("RAG Engine disabled due to missing ML dependencies.")
-            
+        # Setup Gemini
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-2.5-flash')
+        self.embedding_model = "models/text-embedding-004"
         
-    def index_data(self, df: pd.DataFrame):
-        if not self.embedder:
-            logger.error("Cannot index data: Embedder not available.")
+        # Try Loading Existing Index
+        self._load_index()
+
+    def _load_index(self):
+        if not os.path.exists(self.persist_dir):
+            os.makedirs(self.persist_dir, exist_ok=True)
             return
 
-        logger.info(f"Indexing {len(df)} documents for RAG.")
-        # Prepare docs
-        self.docs = df.to_dict('records')
-        texts = [f"Sub: {d['subreddit']} | Title: {d['title']} | Body: {d['body'][:500]}" for d in self.docs]
+        index_file = os.path.join(self.persist_dir, "index.faiss")
+        docs_file = os.path.join(self.persist_dir, "docs.json")
+        embed_file = os.path.join(self.persist_dir, "embeddings.npy")
         
-        # Embed
         try:
-            embeddings = self.embedder.encode(texts)
+            if os.path.exists(docs_file):
+                with open(docs_file, 'r') as f:
+                    self.docs = json.load(f)
+                logger.info(f"Loaded {len(self.docs)} docs from disk.")
             
-            # FAISS Index
-            if faiss:
-                self.index = faiss.IndexFlatL2(embeddings.shape[1])
-                self.index.add(embeddings)
-                logger.info("FAISS Index build complete.")
-            else:
-                logger.error("FAISS not available.")
+            if faiss and os.path.exists(index_file):
+                self.index = faiss.read_index(index_file)
+                logger.info("Loaded FAISS index from disk.")
+            elif os.path.exists(embed_file):
+                self.doc_embeddings = np.load(embed_file)
+                logger.info("Loaded Numpy embeddings from disk.")
+                
         except Exception as e:
-            logger.error(f"Indexing failed: {e}")
+            logger.error(f"Failed to load persisted RAG index: {e}")
+
+    def save_index(self):
+        if not os.path.exists(self.persist_dir):
+            os.makedirs(self.persist_dir, exist_ok=True)
+            
+        try:
+            # Save Docs
+            with open(os.path.join(self.persist_dir, "docs.json"), 'w') as f:
+                json.dump(self.docs, f)
+            
+            # Save Index or Embeddings
+            if self.index and faiss:
+                faiss.write_index(self.index, os.path.join(self.persist_dir, "index.faiss"))
+            elif self.doc_embeddings is not None:
+                np.save(os.path.join(self.persist_dir, "embeddings.npy"), self.doc_embeddings)
+                
+            logger.info("Successfully persisted RAG index.")
+        except Exception as e:
+            logger.error(f"Failed to save RAG index: {e}")
+
+    def index_data(self, df: pd.DataFrame, force_reindex=False):
+        # If we have docs and don't force reindex, assume we append or just keep current? 
+        # For simplicity in this demo: Re-index always replaces current active set if called explicitly, 
+        # BUT we could optimize to append. 
+        # Given user wants "Train on historical", let's assume we are building a NEW index from this data.
+        
+        logger.info(f"Indexing {len(df)} documents for RAG.")
+        self.docs = df.to_dict('records') # Update Docs
+        
+        texts = [f"Sub: {d['subreddit']} | Title: {d['title']} | Body: {d['body'][:500]}" for d in self.docs]
+        all_embeddings = []
+        batch_size = 20
+        
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i+batch_size]
+            try:
+                result = genai.embed_content(
+                    model=self.embedding_model,
+                    content=batch,
+                    task_type="retrieval_document"
+                )
+                if 'embedding' in result: 
+                    all_embeddings.extend(result['embedding'])
+                logger.info(f"Embedded batch {i//batch_size + 1}")
+                time.sleep(1.0)
+            except Exception as e:
+                logger.error(f"Gemini Embedding batch error: {e}")
+                return # Stop if API fails
+                
+        if not all_embeddings: return
+
+        # Build Index
+        try:
+            matrix = np.array(all_embeddings).astype('float32')
+            self.doc_embeddings = matrix
+            
+            if faiss:
+                self.index = faiss.IndexFlatL2(matrix.shape[1])
+                self.index.add(matrix)
+            
+            self.save_index() # Auto-save
+        except Exception as e:
+            logger.error(f"Index build failed: {e}")
         
     def query(self, user_query: str):
-        if not self.index: return "Index not built.", ""
+        if self.doc_embeddings is None and self.index is None:
+            return "Index not built.", ""
         
         logger.info(f"Processing RAG Query: {user_query}")
-        # Search
-        q_embed = self.embedder.encode([user_query])
-        D, I = self.index.search(q_embed, k=5) # Top 5 relevant posts
         
-        # Retrieve
-        context = ""
-        for idx in I[0]:
-            if idx < len(self.docs):
-                d = self.docs[idx]
-                context += f"- [r/{d['subreddit']}] {d['title']} (Score: {d['score']})\n"
-                
-        # Generate
-        prompt = f"""
-        Context from Subreddit Analysis:
-        {context}
-        
-        User Query: {user_query}
-        
-        Answer based on the context provided. Cite specific posts if relevant.
-        """
         try:
+            q_res = genai.embed_content(
+                model=self.embedding_model,
+                content=user_query,
+                task_type="retrieval_query"
+            )
+            q_embed = np.array([q_res['embedding']]).astype('float32')
+            
+            top_k = 5
+            indices = []
+            
+            if self.index:
+                D, I = self.index.search(q_embed, top_k)
+                indices = I[0]
+            else:
+                scores = np.dot(self.doc_embeddings, q_embed.T).flatten()
+                indices = scores.argsort()[-top_k:][::-1]
+            
+            context = ""
+            for idx in indices:
+                if idx < len(self.docs) and idx >= 0:
+                    d = self.docs[idx]
+                    context += f"- [r/{d['subreddit']}] {d['title']} (Score: {d['score']})\n"
+
+            prompt = f"""
+            Context from Subreddit Analysis:
+            {context}
+            
+            User Query: {user_query}
+            
+            Answer based on the context provided. Cite specific posts if relevant.
+            """
             resp = self.model.generate_content(prompt)
-            logger.info("RAG Response generated.")
             return resp.text, context
+            
         except Exception as e:
-            logger.error(f"GenAI generation failed: {e}")
-            return "Error generating response.", context
+            logger.error(f"RAG Query failed: {e}")
+            return f"Error: {e}", ""

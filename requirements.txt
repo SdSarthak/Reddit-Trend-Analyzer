@@ -1,6 +1,6 @@
 streamlit
 requests
-google-generativeai
+google-generativeai>=0.8.3
 python-dotenv
 pandas
 plotly

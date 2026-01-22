@@ -247,10 +247,12 @@ class RAGEngine:
         self.docs = []
         self.doc_embeddings = None
         self.persist_dir = persist_dir
+        self.last_error = None
+        self.api_key = api_key
         
         # Setup Gemini
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-2.5-flash')
+        genai.configure(api_key=self.api_key)
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
         self.embedding_model = "models/text-embedding-004"
         
         # Try Loading Existing Index
@@ -301,11 +303,11 @@ class RAGEngine:
             logger.error(f"Failed to save RAG index: {e}")
 
     def index_data(self, df: pd.DataFrame, force_reindex=False):
-        # If we have docs and don't force reindex, assume we append or just keep current? 
-        # For simplicity in this demo: Re-index always replaces current active set if called explicitly, 
-        # BUT we could optimize to append. 
-        # Given user wants "Train on historical", let's assume we are building a NEW index from this data.
-        
+        # Prevent redundant indexing to save API Quota
+        if (self.index is not None or self.doc_embeddings is not None) and not force_reindex:
+            logger.info("RAG Index already exists. Skipping re-indexing.")
+            return
+
         logger.info(f"Indexing {len(df)} documents for RAG.")
         self.docs = df.to_dict('records') # Update Docs
         
@@ -313,6 +315,14 @@ class RAGEngine:
         all_embeddings = []
         batch_size = 20
         
+        self.last_error = None # Reset error
+        
+        # Ensure API config is active
+        try:
+            genai.configure(api_key=self.api_key)
+        except Exception as e:
+            logger.warning(f"Re-configuration failed: {e}")
+
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i+batch_size]
             try:
@@ -326,10 +336,14 @@ class RAGEngine:
                 logger.info(f"Embedded batch {i//batch_size + 1}")
                 time.sleep(1.0)
             except Exception as e:
-                logger.error(f"Gemini Embedding batch error: {e}")
+                error_msg = f"Gemini Embedding batch error: {e}"
+                logger.error(error_msg)
+                self.last_error = error_msg
                 return # Stop if API fails
                 
-        if not all_embeddings: return
+        if not all_embeddings: 
+            self.last_error = "No embeddings generated (possibly API empty response)."
+            return
 
         # Build Index
         try:
@@ -342,15 +356,20 @@ class RAGEngine:
             
             self.save_index() # Auto-save
         except Exception as e:
-            logger.error(f"Index build failed: {e}")
+            self.last_error = f"Index build failed: {e}"
+            logger.error(self.last_error)
         
     def query(self, user_query: str):
         if self.doc_embeddings is None and self.index is None:
-            return "Index not built.", ""
+            msg = "Index not built."
+            if self.last_error:
+                msg += f" (Last Error: {self.last_error})"
+            return msg, ""
         
         logger.info(f"Processing RAG Query: {user_query}")
         
         try:
+            genai.configure(api_key=self.api_key)
             q_res = genai.embed_content(
                 model=self.embedding_model,
                 content=user_query,

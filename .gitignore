@@ -1,6 +1,7 @@
 # Environment
 .env
-.env.local
+.env.*
+!.env.example
 *.pem
 *.key
 credentials.json
@@ -13,13 +14,25 @@ __pycache__/
 venv/
 env/
 .venv/
+.pytest_cache/
+.ipynb_checkpoints/
 
-# Data / models
+# Data / generated artifacts
+data/
+reports/
+rag_store/
+*.csv
+*.parquet
+*.db
 *.sqlite3
+*.xlsx
 *.pkl
 *.h5
 *.pt
 *.ckpt
+
+# JS tooling
+node_modules/
 
 # OS / editor
 .DS_Store

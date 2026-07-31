@@ -1,20 +1,20 @@
-import streamlit as st
-import requests
-import google.generativeai as genai
-import json
 import pandas as pd
-from typing import List, Dict
-import os
-from dotenv import load_dotenv
-from subsense_engine import RedditFetcher, TrendEngine, ViralityPredictor, ModClassifier, RAGEngine
+import plotly.express as px
+import streamlit as st
 
-# Load Environment Variables
-load_dotenv()
+import config
+from subsense_engine import (
+    ModClassifier,
+    RAGEngine,
+    RedditFetcher,
+    TrendEngine,
+    ViralityPredictor,
+    run_pipeline,
+    summarize,
+)
 
-# Page Config
 st.set_page_config(page_title="SubSense AI", page_icon="🧠", layout="wide")
 
-# Custom CSS for "Premium" Feel
 st.markdown("""
     <style>
     .main { background-color: #0E1117; }
@@ -38,115 +38,156 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Application Title
 st.title("🧠 SubSense: GenAI Reddit Intelligence")
 st.markdown("### *Beyond Social Listening — True Community Understanding*")
+
 
 # --- 1. Sidebar Configuration ---
 with st.sidebar:
     st.header("🔧 Configuration")
-    
-    # API Key Handling (Env -> Input Fallback)
-    env_api_key = os.getenv("GEMINI_API_KEY")
-    api_key = st.text_input("Gemini API Key", value=env_api_key if env_api_key else "", type="password")
-    
+
+    reddit_ready = bool(config.REDDIT_CLIENT_ID and config.REDDIT_CLIENT_SECRET)
+    if reddit_ready:
+        st.success("✅ Reddit credentials loaded.")
+    else:
+        st.error(
+            "❌ Reddit credentials missing. Reddit returns 403 for anonymous access. "
+            "Create a free *script* app at reddit.com/prefs/apps and set "
+            "`REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` in `.env`."
+        )
+
+    # Key handling: environment first, manual entry as a fallback.
+    api_key = st.text_input("Gemini API Key", value=config.GEMINI_API_KEY, type="password",
+                            help="Only needed for the chat tab. Leave blank to run analysis only.")
     if not api_key:
-        st.warning("⚠️ Please provide an API Key in .env or here.")
-        
+        st.info("💬 Chat is disabled without a Gemini key. Everything else still works.")
+
     st.markdown("---")
     st.subheader("🎯 Target Communities")
     sub_input = st.text_input("Subreddits (comma separated)", "AI_India, MachineLearning, startups")
-    
+
     st.subheader("⏳ Time & Scope")
-    time_filter = st.selectbox("Time Range", ["day", "week", "month", "year", "all"], index=2)
-    post_limit = st.slider("Max Posts per Sub", 50, 500, 100) # Increased range for "Production" feel
-    
-    analyze_btn = st.button("🚀 Launch Analysis")
-    
+    time_filter = st.selectbox("Time Range", list(config.TIME_FILTERS),
+                               index=list(config.TIME_FILTERS).index("month"))
+    post_limit = st.slider("Max Posts per Sub", 50, 500, 100)
+
+    analyze_btn = st.button("🚀 Launch Analysis", disabled=not reddit_ready)
+
     st.markdown("---")
-    st.info("💡 **Pro Tip**: Use 'all' time range for deep historical training.")
+    st.info("💡 **Pro Tip**: Use the 'all' time range for deep historical training.")
 
-# --- 2. Initialize Engines (Cached Resource) ---
+
+# --- 2. Initialize Engines ---
 @st.cache_resource
-def load_engines(api_key):
-    # Only load RAG if we have a key
-    rag = RAGEngine(api_key) if api_key else None
-    return RedditFetcher(), TrendEngine(), ViralityPredictor(), ModClassifier(), rag
+def load_offline_engines():
+    """Layers that need no credentials, so the dashboard works without any key."""
+    return TrendEngine(), ViralityPredictor(), ModClassifier()
 
-fetcher, trend_engine, predictor, mod_classifier, rag = load_engines(api_key)
 
-# --- 3. Cached Data Fetching ---
-@st.cache_data(ttl=3600, show_spinner=False) # Cache for 1 hour
+@st.cache_resource
+def load_rag(key: str):
+    """Returns (engine, error). Kept separate so a bad key cannot break the dashboard."""
+    if not key:
+        return None, "No Gemini API key provided."
+    try:
+        return RAGEngine(key), None
+    except Exception as e:
+        return None, str(e)
+
+
+trend_engine, predictor, mod_classifier = load_offline_engines()
+rag, rag_error = load_rag(api_key)
+
+
+@st.cache_data(ttl=config.CACHE_TTL, show_spinner=False)
 def get_reddit_data(subreddits_list, time_filter, limit):
-    return fetcher.fetch_data(subreddits_list, time_filter, limit)
+    """Cached fetch. Returns (dataframe, error) so failures survive the cache."""
+    fetcher = RedditFetcher()
+    df = fetcher.fetch_data(subreddits_list, time_filter, limit)
+    return df, fetcher.last_error
 
-# --- 4. Main Application Logic ---
-if analyze_btn and api_key:
-    subs = [s.strip() for s in sub_input.split(',')]
-    
-    with st.spinner("📡 Fetching & Normalizing Data (Cached)..."):
-        try:
-            df = get_reddit_data(subs, time_filter, limit=post_limit)
-        except Exception as e:
-            st.error(f"Data Fetch Failed: {e}")
-            st.stop()
-            
-    if not df.empty:
-        # Save to session state to persist across reruns
-        st.session_state['df'] = df
-        st.success(f"✅ Loaded {len(df)} posts from {len(subs)} communities.")
+
+# --- 3. Main Application Logic ---
+if analyze_btn:
+    subs = [s.strip() for s in sub_input.split(',') if s.strip()]
+    if not subs:
+        st.error("❌ Enter at least one subreddit.")
     else:
-        st.error("❌ No data found. Check subreddit names.")
+        with st.spinner("📡 Fetching & Normalizing Data (Cached)..."):
+            try:
+                df, fetch_error = get_reddit_data(subs, time_filter, post_limit)
+            except Exception as e:
+                st.error(f"Data Fetch Failed: {e}")
+                st.stop()
 
-# Check if data exists in session
-if 'df' in st.session_state:
-    df = st.session_state['df']
-    
-    # Process Data (Apply Intelligence Layers)
+        if not df.empty:
+            st.session_state['raw_df'] = df
+            st.session_state.pop('df', None)
+            st.success(f"✅ Loaded {len(df)} posts from {len(subs)} communities.")
+        else:
+            st.error(f"❌ {fetch_error or 'No data found. Check the subreddit names.'}")
+
+
+# Process once per fetch rather than on every widget interaction.
+if 'raw_df' in st.session_state and 'df' not in st.session_state:
     with st.spinner("🧠 Running Intelligence Layers..."):
         try:
-            # 1. Trends
-            df = trend_engine.extract_trends(df)
-            # 2. Mod Risk
-            df = mod_classifier.score_risk(df)
-            # 3. Virality (Predict Only if trained, or Train if requested in MLOps)
-            df = predictor.train_and_score(df) # Logic handles persistence
-            # 4. RAG Indexing (Only if not already indexed? For now re-index active session data)
-            if rag: rag.index_data(df)
+            st.session_state['df'] = run_pipeline(
+                st.session_state['raw_df'],
+                trend_engine=trend_engine,
+                predictor=predictor,
+                mod_classifier=mod_classifier,
+            )
         except Exception as e:
             st.error(f"Intelligence Layer Error: {e}")
 
-    # --- UI TABS ---
+if 'df' in st.session_state:
+    df = st.session_state['df']
+    stats = summarize(df)
+
     tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "🧠 Deep Insights", "💬 Ask SubSense", "⚙️ MLOps"])
-    
+
     # TAB 1: Dashboard
     with tab1:
         st.subheader("Bi-Directional Market Pulse")
         try:
             col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Total Volume", f"{len(df)}")
-            col2.metric("Avg Engagement", f"{int(df['score'].mean())}")
-            col3.metric("Video/Image Content", f"{len(df[df['media_type'] != 'text'])}")
-            col4.metric("High Risk Posts", f"{len(df[df['mod_risk_score'] > 1.0])}")
-            
-            # Visuals
-            import plotly.express as px
-            
+            col1.metric("Total Volume", stats['total_posts'])
+            col2.metric("Avg Engagement", stats['avg_score'])
+            col3.metric("Video/Image Content", stats['media_posts'])
+            col4.metric("High Risk Posts", stats['high_risk_posts'])
+
             c1, c2 = st.columns(2)
             with c1:
                 st.markdown("#### 🔥 Trending Topics")
-                topic_counts = df['topic_keywords'].value_counts().reset_index()
-                topic_counts.columns = ['Topic', 'Count']
-                fig_topics = px.bar(topic_counts, x='Count', y='Topic', orientation='h', color='Count', color_continuous_scale='Viridis')
-                st.plotly_chart(fig_topics, use_container_width=True)
-                
+                topics = TrendEngine.top_topics(df)
+                if topics.empty:
+                    st.info("No topics extracted.")
+                else:
+                    fig_topics = px.bar(topics, x='posts', y='topic_keywords', orientation='h',
+                                        color='posts', color_continuous_scale='Viridis',
+                                        labels={'posts': 'Posts', 'topic_keywords': 'Topic'})
+                    fig_topics.update_layout(yaxis={'categoryorder': 'total ascending'})
+                    st.plotly_chart(fig_topics, use_container_width=True)
+
             with c2:
                 st.markdown("#### ❤️ Sentiment Distribution")
                 if 'sentiment' in df.columns:
-                    fig_sent = px.histogram(df, x='sentiment', nbins=20, color_discrete_sequence=['#FF4B4B'])
+                    fig_sent = px.histogram(df, x='sentiment', nbins=20,
+                                            color_discrete_sequence=['#FF4B4B'])
                     st.plotly_chart(fig_sent, use_container_width=True)
                 else:
                     st.warning("Sentiment data unavailable.")
+
+            st.markdown("#### 🕒 When This Community Posts")
+            hourly = (pd.to_datetime(df['created_utc'], errors='coerce').dt.hour
+                        .value_counts().sort_index().rename_axis('hour').reset_index(name='posts'))
+            if not hourly.empty:
+                st.plotly_chart(
+                    px.bar(hourly, x='hour', y='posts', color_discrete_sequence=['#FF914D'],
+                           labels={'hour': 'Hour (UTC)', 'posts': 'Posts'}),
+                    use_container_width=True,
+                )
 
             with st.expander("🔎 Inspect Raw Data"):
                 st.dataframe(df)
@@ -156,39 +197,50 @@ if 'df' in st.session_state:
     # TAB 2: Insights
     with tab2:
         c1, c2 = st.columns(2)
-        
+
         with c1:
             st.subheader("🚨 Mod Queue Simulator")
             risky_posts = df.sort_values('mod_risk_score', ascending=False).head(5)
+            if risky_posts['mod_risk_score'].max() == 0:
+                st.success("No posts show mod-risk signals in this sample.")
             for _, post in risky_posts.iterrows():
-                with st.container():
-                    st.markdown(f"**{post['title']}** (Risk: {post['mod_risk_score']:.1f})")
-                    st.caption(f"Reason: Low Ratio ({post['upvote_ratio']}) • Locked: {post['is_locked']}")
-                    st.divider()
+                if post['mod_risk_score'] == 0:
+                    continue
+                st.markdown(f"**{post['title']}** (Risk: {post['mod_risk_score']:.1f})")
+                st.caption(
+                    f"r/{post['subreddit']} • Ratio {post['upvote_ratio']:.2f} • "
+                    f"Signals: {post['risk_reasons']}"
+                )
+                st.divider()
 
         with c2:
             st.subheader("🚀 Virality Sandbox")
-            st.markdown("Test your titles against our **trained XGBoost model**.")
-            
+            st.markdown("Test your titles against the **trained XGBoost model**.")
+
             test_title = st.text_input("Draft Title", "How to build a SaaS in 2 weeks")
-            test_media = st.selectbox("Media Type", ["text", "image", "video"])
+            test_media = st.selectbox("Media Type", ["text", "image", "video", "gallery", "link"])
             test_hour = st.slider("Posting Hour (UTC)", 0, 23, 14)
-            
+            days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            test_day = st.selectbox("Posting Day", days)
+
             if st.button("Predict Potential"):
                 if predictor.is_trained:
-                    score = predictor.predict_new(test_title, test_media, test_hour)
+                    score = predictor.predict_new(test_title, test_media, test_hour,
+                                                  day_of_week=days.index(test_day))
                     st.balloons()
                     st.success(f"🔮 Predicted Score: **{int(score)}**")
                 else:
-                    st.warning("⚠️ Model not trained yet. Please train in MLOps tab.")
+                    st.warning("⚠️ Model not trained yet. Train it in the MLOps tab.")
 
     # TAB 3: RAG Chat
     with tab3:
         st.subheader("💬 Chat with the Data")
         if not rag:
-            st.error("RAG Engine unavailable (Missing Key or Libs).")
+            st.error(f"RAG Engine unavailable: {rag_error}")
         else:
-            # Simple Chat Interface
+            if not rag.is_indexed():
+                st.info("Build the knowledge base in the ⚙️ MLOps tab before asking questions.")
+
             if "messages" not in st.session_state:
                 st.session_state.messages = []
 
@@ -206,34 +258,48 @@ if 'df' in st.session_state:
                         try:
                             response, context = rag.query(prompt)
                             st.markdown(response)
-                            with st.expander("📚 View Sources"):
-                                st.markdown(context)
-                            st.session_state.messages.append({"role": "assistant", "content": response})
+                            if context:
+                                with st.expander("📚 View Sources"):
+                                    st.markdown(context)
+                            st.session_state.messages.append(
+                                {"role": "assistant", "content": response})
                         except Exception as e:
                             st.error(f"Chat Error: {e}")
 
     # TAB 4: MLOps
     with tab4:
         st.subheader("⚙️ System Operations")
-        
+
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("### 🧠 Virality Model")
             st.info(f"Status: **{'Trained & Loaded' if predictor.is_trained else 'Not Trained'}**")
             st.markdown(f"Path: `{predictor.model_path}`")
-            
+            st.caption(f"Features: {', '.join(ViralityPredictor.FEATURES)}")
+
             if st.button("🔄 Force Retrain (Current Data)"):
                 with st.spinner("Training & Saving Model..."):
-                    predictor.train_and_score(df, force_retrain=True)
-                st.success("Model Retrained & Saved!")
-                
+                    st.session_state['df'] = predictor.train_and_score(df, force_retrain=True)
+                if predictor.is_trained:
+                    st.success("Model retrained and saved.")
+                else:
+                    st.warning("Training needs at least 10 posts. Widen the time range.")
+
         with c2:
             st.markdown("### 📚 Knowledge Base")
             st.info(f"Status: **{len(rag.docs) if rag else 0} Docs Indexed**")
             st.markdown(f"Path: `{rag.persist_dir if rag else 'N/A'}`")
-            
-            if st.button("🔄 Re-Index Knowledge Base"):
-                if rag:
-                    with st.spinner("Re-indexing & Persisting..."):
-                        rag.index_data(df, force_reindex=True)
-                    st.success("Knowledge Base Updated on Disk!")
+            st.caption("Indexing calls the Gemini embedding API once per batch of posts.")
+
+            if st.button("🔄 Build / Re-Index Knowledge Base", disabled=rag is None):
+                with st.spinner("Indexing & Persisting..."):
+                    ok = rag.index_data(df, force_reindex=True)
+                if ok:
+                    st.success(f"Knowledge base updated on disk ({len(rag.docs)} docs).")
+                else:
+                    st.error(f"Indexing failed: {rag.last_error}")
+else:
+    st.markdown(
+        "Configure your credentials in the sidebar, pick a few communities and hit "
+        "**Launch Analysis**. Prefer a terminal? `python cli.py --subreddits startups --time week`."
+    )

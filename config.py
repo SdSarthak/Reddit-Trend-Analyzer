@@ -38,8 +38,15 @@ GEMINI_CHAT_MODEL = _get_str("GEMINI_CHAT_MODEL", "gemini-1.5-flash")
 GEMINI_EMBED_MODEL = _get_str("GEMINI_EMBED_MODEL", "models/text-embedding-004")
 
 # --- Reddit ----------------------------------------------------------------
+# Reddit stopped serving the anonymous .json endpoints to scripts (HTTP 403),
+# so a free "script" app from https://www.reddit.com/prefs/apps is now the
+# supported path. No user login is needed: it is application-only OAuth.
+REDDIT_CLIENT_ID = _get_str("REDDIT_CLIENT_ID", "")
+REDDIT_CLIENT_SECRET = _get_str("REDDIT_CLIENT_SECRET", "")
 REDDIT_BASE_URL = _get_str("REDDIT_BASE_URL", "https://www.reddit.com").rstrip("/")
-REDDIT_USER_AGENT = _get_str("REDDIT_USER_AGENT", "SubSense/2.0 (public JSON reader)")
+REDDIT_OAUTH_URL = _get_str("REDDIT_OAUTH_URL", "https://oauth.reddit.com").rstrip("/")
+REDDIT_TOKEN_URL = _get_str("REDDIT_TOKEN_URL", "https://www.reddit.com/api/v1/access_token")
+REDDIT_USER_AGENT = _get_str("REDDIT_USER_AGENT", "python:subsense:v2.0 (by /u/subsense)")
 REQUEST_TIMEOUT = _get_float("REQUEST_TIMEOUT", 15.0)
 REQUEST_DELAY = _get_float("REQUEST_DELAY", 1.0)
 MAX_RETRIES = _get_int("MAX_RETRIES", 3)

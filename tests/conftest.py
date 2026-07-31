@@ -53,17 +53,30 @@ class FakeResponse:
 
 
 class FakeSession:
-    """Serves a queued list of responses and records the URLs requested."""
+    """Serves a queued list of responses and records what was requested."""
 
-    def __init__(self, responses):
+    def __init__(self, responses, token_responses=None):
         self.responses = list(responses)
+        self.token_responses = list(token_responses or [])
         self.requests = []
+        self.headers_seen = []
+        self.token_requests = []
 
     def get(self, url, headers=None, timeout=None):
         self.requests.append(url)
+        self.headers_seen.append(dict(headers or {}))
         if not self.responses:
             return FakeResponse({"data": {"after": None, "children": []}})
         item = self.responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def post(self, url, auth=None, data=None, headers=None, timeout=None):
+        self.token_requests.append({"url": url, "auth": auth, "data": data})
+        if not self.token_responses:
+            return FakeResponse({"access_token": "tok", "expires_in": 3600})
+        item = self.token_responses.pop(0)
         if isinstance(item, Exception):
             raise item
         return item

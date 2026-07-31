@@ -6,9 +6,13 @@ from conftest import FakeResponse, FakeSession, listing, raw_post
 from subsense_engine import POST_COLUMNS, RedditFetcher, detect_media_type, empty_frame
 
 
-def make_fetcher(responses):
+def make_fetcher(responses, **kwargs):
     session = FakeSession(responses)
-    fetcher = RedditFetcher(session=session, base_url="https://example.test", delay=0, max_retries=2)
+    kwargs.setdefault("client_id", "")
+    kwargs.setdefault("client_secret", "")
+    fetcher = RedditFetcher(session=session, base_url="https://example.test",
+                            oauth_url="https://oauth.example.test", delay=0,
+                            max_retries=2, **kwargs)
     return fetcher, session
 
 
@@ -134,3 +138,72 @@ def test_fetch_data_survives_a_failing_subreddit():
     df = fetcher.fetch_data(["broken", "working"], limit=5)
     assert len(df) == 1
     assert df.loc[0, "subreddit"] == "working"
+
+
+def test_anonymous_failure_explains_how_to_authenticate():
+    fetcher, _ = make_fetcher([FakeResponse(None, status_code=403)])
+    df = fetcher.fetch_data(["python"], limit=5)
+    assert df.empty
+    assert "REDDIT_CLIENT_ID" in fetcher.last_error
+
+
+# --- OAuth path ------------------------------------------------------------
+
+def make_authed_fetcher(responses, token_responses=None):
+    session = FakeSession(responses, token_responses)
+    fetcher = RedditFetcher(session=session, base_url="https://example.test",
+                            oauth_url="https://oauth.example.test",
+                            token_url="https://token.example.test",
+                            delay=0, max_retries=2,
+                            client_id="cid", client_secret="secret")
+    return fetcher, session
+
+
+def test_credentials_switch_the_fetcher_to_oauth():
+    fetcher, session = make_authed_fetcher([FakeResponse(listing([raw_post("a", "t")]))])
+    assert fetcher.authenticated
+    fetcher.fetch_data(["python"], limit=5)
+    assert session.requests[0].startswith("https://oauth.example.test/r/python/top")
+    assert session.headers_seen[0]["Authorization"] == "bearer tok"
+
+
+def test_token_is_requested_once_and_reused():
+    pages = [FakeResponse(listing([raw_post(f"a{i}", "t")], after=None)) for i in range(3)]
+    fetcher, session = make_authed_fetcher(pages)
+    fetcher.fetch_data(["a", "b", "c"], limit=5)
+    assert len(session.token_requests) == 1
+    assert session.token_requests[0]["data"] == {"grant_type": "client_credentials"}
+    assert session.token_requests[0]["auth"] == ("cid", "secret")
+
+
+def test_expired_token_is_refreshed():
+    fetcher, session = make_authed_fetcher(
+        [FakeResponse(None, status_code=401), FakeResponse(listing([raw_post("a", "t")]))],
+        token_responses=[FakeResponse({"access_token": "old", "expires_in": 3600}),
+                         FakeResponse({"access_token": "new", "expires_in": 3600})],
+    )
+    df = fetcher.fetch_data(["python"], limit=5)
+    assert len(df) == 1
+    assert len(session.token_requests) == 2
+    assert session.headers_seen[-1]["Authorization"] == "bearer new"
+
+
+def test_bad_credentials_stop_the_run_with_a_clear_message():
+    fetcher, session = make_authed_fetcher(
+        [FakeResponse(listing([raw_post("a", "t")]))],
+        token_responses=[FakeResponse(None, status_code=401)],
+    )
+    df = fetcher.fetch_data(["one", "two"], limit=5)
+    assert df.empty
+    assert "REDDIT_CLIENT_ID" in fetcher.last_error
+    assert session.requests == []  # bailed before hammering the API per subreddit
+
+
+def test_missing_access_token_is_an_auth_error():
+    fetcher, _ = make_authed_fetcher(
+        [FakeResponse(listing([raw_post("a", "t")]))],
+        token_responses=[FakeResponse({"token_type": "bearer"})],
+    )
+    df = fetcher.fetch_data(["python"], limit=5)
+    assert df.empty
+    assert "access_token" in fetcher.last_error

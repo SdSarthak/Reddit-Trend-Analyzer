@@ -99,22 +99,116 @@ def detect_media_type(post: Dict[str, Any]) -> str:
     return 'link'
 
 
+class RedditAuthError(RuntimeError):
+    """Raised when Reddit credentials are present but rejected."""
+
+
+class RedditAuth:
+    """Application-only OAuth ("client credentials") for Reddit's read API.
+
+    Reddit no longer serves the anonymous `www.reddit.com/....json` endpoints to
+    scripts — they answer 403 regardless of user agent. A free "script" app on
+    https://www.reddit.com/prefs/apps gives an id/secret pair that unlocks the
+    same public listings via oauth.reddit.com, with no user login involved.
+    """
+
+    def __init__(self, client_id: str, client_secret: str, session: requests.Session,
+                 user_agent: str = config.REDDIT_USER_AGENT,
+                 token_url: str = config.REDDIT_TOKEN_URL,
+                 timeout: float = config.REQUEST_TIMEOUT):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.session = session
+        self.user_agent = user_agent
+        self.token_url = token_url
+        self.timeout = timeout
+        self._token: Optional[str] = None
+        self._expires_at: float = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.client_id and self.client_secret)
+
+    def invalidate(self) -> None:
+        self._token = None
+        self._expires_at = 0.0
+
+    def token(self) -> str:
+        """A valid bearer token, refreshed a minute before it actually expires."""
+        if self._token and time.time() < self._expires_at:
+            return self._token
+
+        resp = self.session.post(
+            self.token_url,
+            auth=(self.client_id, self.client_secret),
+            data={"grant_type": "client_credentials"},
+            headers={"User-Agent": self.user_agent},
+            timeout=self.timeout,
+        )
+        if resp.status_code != 200:
+            raise RedditAuthError(
+                f"Reddit rejected the credentials (HTTP {resp.status_code}). "
+                "Check REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET."
+            )
+        payload = resp.json()
+        token = payload.get("access_token")
+        if not token:
+            raise RedditAuthError("Reddit returned no access_token.")
+
+        self._token = token
+        self._expires_at = time.time() + max(60.0, float(payload.get("expires_in", 3600))) - 60.0
+        logger.info("Obtained Reddit OAuth token.")
+        return self._token
+
+
 class RedditFetcher:
-    """Fetches posts from Reddit's public JSON endpoints (no PRAW / OAuth needed)."""
+    """Fetches posts from Reddit.
+
+    Uses application-only OAuth when `REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET`
+    are configured, and falls back to the legacy anonymous JSON endpoints
+    otherwise. The fallback is kept for offline/mirror setups; against live
+    Reddit it now returns 403, and `fetch_data` says so explicitly.
+    """
 
     def __init__(self, session: Optional[requests.Session] = None,
                  base_url: str = config.REDDIT_BASE_URL,
+                 oauth_url: str = config.REDDIT_OAUTH_URL,
                  user_agent: str = config.REDDIT_USER_AGENT,
                  timeout: float = config.REQUEST_TIMEOUT,
                  delay: float = config.REQUEST_DELAY,
-                 max_retries: int = config.MAX_RETRIES):
+                 max_retries: int = config.MAX_RETRIES,
+                 client_id: str = config.REDDIT_CLIENT_ID,
+                 client_secret: str = config.REDDIT_CLIENT_SECRET,
+                 token_url: str = config.REDDIT_TOKEN_URL):
         self.session = session or requests.Session()
         self.base_url = base_url.rstrip('/')
-        self.headers = {'User-Agent': user_agent}
+        self.oauth_url = oauth_url.rstrip('/')
+        self.user_agent = user_agent
         self.timeout = timeout
         self.delay = delay
         self.max_retries = max_retries
-        logger.info("RedditFetcher initialized.")
+        self.auth = RedditAuth(client_id, client_secret, self.session,
+                               user_agent=user_agent, token_url=token_url, timeout=timeout)
+        self.last_error: Optional[str] = None
+        logger.info(
+            "RedditFetcher initialized (%s).",
+            "OAuth" if self.auth.enabled else "anonymous JSON",
+        )
+
+    @property
+    def authenticated(self) -> bool:
+        return self.auth.enabled
+
+    def _headers(self) -> Dict[str, str]:
+        headers = {'User-Agent': self.user_agent}
+        if self.auth.enabled:
+            headers['Authorization'] = f"bearer {self.auth.token()}"
+        return headers
+
+    def _listing_url(self, subreddit: str, time_filter: str) -> str:
+        if self.auth.enabled:
+            return f"{self.oauth_url}/r/{subreddit}/top?t={time_filter}&raw_json=1"
+        return f"{self.base_url}/r/{subreddit}/top/.json?t={time_filter}&raw_json=1"
 
     def fetch_data(self, subreddits: Sequence[str], time_filter: str = 'month',
                    limit: int = 100) -> pd.DataFrame:
@@ -130,18 +224,31 @@ class RedditFetcher:
             return empty_frame()
 
         all_data: List[Dict[str, Any]] = []
+        self.last_error = None
         logger.info(f"Fetching data for subreddits: {names}, Time: {time_filter}, Limit: {limit}")
 
         for sub in names:
-            url = f"{self.base_url}/r/{sub}/top/.json?t={time_filter}"
+            url = self._listing_url(sub, time_filter)
             try:
                 results = self._fetch_paginated(url, limit)
                 for post in results:
                     post['source_subreddit'] = sub
                 all_data.extend(results)
                 logger.info(f"Successfully fetched {len(results)} posts from r/{sub}")
+            except RedditAuthError as e:
+                self.last_error = str(e)
+                logger.error(f"Authentication failed while fetching r/{sub}: {e}")
+                break
             except Exception as e:
                 logger.error(f"Error fetching r/{sub}: {e}")
+
+        if not all_data and not self.last_error and not self.auth.enabled:
+            self.last_error = (
+                "Reddit blocks anonymous JSON access (HTTP 403). Create a free 'script' app "
+                "at https://www.reddit.com/prefs/apps and set REDDIT_CLIENT_ID and "
+                "REDDIT_CLIENT_SECRET in your .env."
+            )
+            logger.error(self.last_error)
 
         df = self._normalize(all_data)
         logger.info(f"Total normalized records: {len(df)}")
@@ -151,7 +258,7 @@ class RedditFetcher:
         """One listing request, with backoff on throttling and transient errors."""
         for attempt in range(1, self.max_retries + 1):
             try:
-                resp = self.session.get(url, headers=self.headers, timeout=self.timeout)
+                resp = self.session.get(url, headers=self._headers(), timeout=self.timeout)
             except requests.RequestException as e:
                 logger.warning(f"Request to {url} failed ({e}); attempt {attempt}/{self.max_retries}")
                 if attempt == self.max_retries:
@@ -165,6 +272,14 @@ class RedditFetcher:
                 except ValueError as e:
                     logger.error(f"Non-JSON response from {url}: {e}")
                     return None
+
+            if resp.status_code == 401 and self.auth.enabled:
+                # Token expired earlier than advertised; drop it and try again.
+                logger.info("Reddit token rejected; refreshing.")
+                self.auth.invalidate()
+                if attempt == self.max_retries:
+                    return None
+                continue
 
             if resp.status_code in (429, 500, 502, 503, 504):
                 wait = self.delay * attempt * 2
@@ -819,18 +934,17 @@ class RAGEngine:
 
 def run_pipeline(df: pd.DataFrame, trend_engine: Optional[TrendEngine] = None,
                  predictor: Optional[ViralityPredictor] = None,
-                 mod_classifier: Optional[ModClassifier] = None) -> pd.DataFrame:
+                 mod_classifier: Optional[ModClassifier] = None,
+                 score_virality: bool = True) -> pd.DataFrame:
     """Apply every offline intelligence layer in order.
 
     Shared by the Streamlit app and the CLI so both produce identical columns.
+    Set `score_virality=False` to skip the layer that can write a model to disk.
     """
-    trend_engine = trend_engine or TrendEngine()
-    predictor = predictor or ViralityPredictor()
-    mod_classifier = mod_classifier or ModClassifier()
-
-    df = trend_engine.extract_trends(df)
-    df = mod_classifier.score_risk(df)
-    df = predictor.train_and_score(df)
+    df = (trend_engine or TrendEngine()).extract_trends(df)
+    df = (mod_classifier or ModClassifier()).score_risk(df)
+    if score_virality:
+        df = (predictor or ViralityPredictor()).train_and_score(df)
     return df
 
 

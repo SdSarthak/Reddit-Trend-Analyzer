@@ -21,6 +21,7 @@ env/
 data/
 reports/
 rag_store/
+virality_model.json
 *.csv
 *.parquet
 *.db
